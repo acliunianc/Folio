@@ -41,10 +41,11 @@ import {
   setConfig,
   writeNote,
 } from "./api";
-import wallpaper from "./assets/default-background.jpg";
 import { Board, snapIconSize } from "./Board";
 import { arrange, moveItem, packTopLeft, placePacked, resizeItem } from "./layout";
 import type { Config, DropMode, FolderChild, GridItem, Placement } from "./types";
+
+const wallpaper = "/t01678398d736b184ed.jpg";
 
 type DragData =
   | { type: "item"; name: string; spanCol: number; spanRow: number }
@@ -1560,7 +1561,7 @@ function FolderLayer({ onClose, children }: { onClose: () => void; children: Rea
     >
       <div
         data-folder-panel
-        className="flex h-[68%] w-[min(720px,86%)] flex-col rounded-[28px] border border-white/35 bg-white/15 p-6 shadow-[0_8px_40px_rgba(0,0,0,0.12)] backdrop-blur-3xl"
+        className="flex h-[68%] w-[min(720px,86%)] flex-col rounded-[28px] border border-white/20 bg-white/8 p-6 shadow-[0_8px_40px_rgba(0,0,0,0.08)] backdrop-blur-sm"
         onClick={(event) => event.stopPropagation()}
       >
         {children}
