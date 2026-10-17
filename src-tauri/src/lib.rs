@@ -359,7 +359,7 @@ fn set_launch_at_login(enabled: bool) -> Result<(), String> {
         RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ,
     };
 
-    const NAME: windows::core::PCWSTR = windows::core::w!("工作区");
+    const NAME: windows::core::PCWSTR = windows::core::w!("Folio");
     unsafe {
         let mut key = HKEY::default();
         let status = RegOpenKeyExW(
@@ -372,6 +372,7 @@ fn set_launch_at_login(enabled: bool) -> Result<(), String> {
         if status != ERROR_SUCCESS {
             return Err("无法写入开机启动项。".into());
         }
+        let _ = RegDeleteValueW(key, windows::core::w!("工作区"));
         let result = if enabled {
             let exe = std::env::current_exe().map_err(|err| format!("找不到程序位置：{err}"))?;
             let quoted = format!("\"{}\"", exe.display());
@@ -710,7 +711,7 @@ fn setup_tray(app: &AppHandle) -> Result<(), String> {
     TrayIconBuilder::new()
         .icon(icon)
         .menu(&menu)
-        .tooltip("工作区")
+        .tooltip("Folio")
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => toggle_window(app),

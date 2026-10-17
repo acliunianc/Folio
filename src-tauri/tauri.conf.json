@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "工作区",
+  "productName": "Folio",
   "version": "0.1.0",
   "identifier": "com.workspace.app",
   "build": {
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "工作区",
+        "title": "Folio",
         "width": 1280,
         "height": 800,
         "visible": false,
