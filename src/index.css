@@ -1,0 +1,61 @@
+@import "tailwindcss";
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: #1a1916;
+  color: #f4f1ea;
+  font-family: "Segoe UI Variable Text", "Segoe UI", sans-serif;
+  user-select: none;
+}
+
+button,
+textarea,
+input {
+  font: inherit;
+}
+
+textarea,
+input {
+  user-select: text;
+}
+
+button {
+  cursor: pointer;
+}
+
+.scroll-hidden {
+  scrollbar-width: none;
+}
+
+.scroll-hidden::-webkit-scrollbar {
+  display: none;
+}
+
+@keyframes wiggle {
+  0%,
+  100% {
+    transform: rotate(0deg);
+  }
+  25% {
+    transform: rotate(-1.4deg);
+  }
+  75% {
+    transform: rotate(1.4deg);
+  }
+}
+
+.wiggle {
+  animation: wiggle 0.28s ease-in-out 2;
+  transform-origin: center 30%;
+}
+
+.desktop-label {
+  color: #fff;
+  -webkit-text-stroke: 3px rgb(0 0 0 / 0.8);
+  paint-order: stroke fill;
+  text-shadow: 0 1px 2px #000;
+}
