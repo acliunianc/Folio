@@ -12,6 +12,12 @@ body,
   user-select: none;
 }
 
+html[data-rail],
+html[data-rail] body,
+html[data-rail] #root {
+  background: transparent;
+}
+
 button,
 textarea,
 input {

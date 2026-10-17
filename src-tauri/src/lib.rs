@@ -1,3 +1,4 @@
+mod drop_shelf;
 mod icon;
 mod model;
 mod shell_menu;
@@ -12,8 +13,10 @@ use tauri::{
 };
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
-struct AppState {
-    config: Mutex<Config>,
+pub(crate) struct AppState {
+    pub(crate) config: Mutex<Config>,
+    pub(crate) surface: Mutex<(String, Vec<String>)>,
+    pub(crate) names: Mutex<Vec<String>>,
 }
 
 #[tauri::command]
@@ -206,20 +209,53 @@ fn open_with(app_path: String, file_path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn drag_file_out(app: AppHandle, path: String) -> Result<(), String> {
-    let file = std::path::PathBuf::from(&path);
-    if !file.is_file() {
-        return Err("只能把文件拖出去打开。".into());
+fn workspace_names(state: State<AppState>) -> Vec<String> {
+    state.names.lock().map(|names| names.clone()).unwrap_or_default()
+}
+
+#[tauri::command]
+fn place_rail(width: f64, height: f64) {
+    drop_shelf::place_rail(width, height);
+}
+
+#[tauri::command]
+fn hover_workspace(name: String) {
+    drop_shelf::activate_workspace(&name);
+}
+
+#[tauri::command]
+fn set_workspace_names(state: State<AppState>, names: Vec<String>) {
+    if let Ok(mut slot) = state.names.lock() {
+        *slot = names;
     }
-    hide_window(&app);
+    drop_shelf::publish_names();
+}
+
+#[tauri::command]
+fn set_active_surface(state: State<AppState>, workspace: String, folders: Vec<String>) {
+    if let Ok(mut surface) = state.surface.lock() {
+        *surface = (workspace, folders);
+    }
+}
+
+#[tauri::command]
+fn clipboard_files() -> Vec<String> {
+    drop_shelf::clipboard_paths()
+}
+
+#[tauri::command]
+fn drag_file_out(app: AppHandle, path: String) -> Result<bool, String> {
+    let file = std::path::PathBuf::from(&path);
+    if !file.exists() {
+        return Err("找不到这个文件。".into());
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
     let handle = app.clone();
     app.run_on_main_thread(move || {
-        let dropped = shell_drag(&path).unwrap_or(false);
-        if !dropped {
-            show_window(&handle);
-        }
+        let _ = tx.send(drag_out_now(&handle, &path));
     })
-    .map_err(|err| err.to_string())
+    .map_err(|err| err.to_string())?;
+    rx.recv().unwrap_or(Err("拖拽被中断。".into()))
 }
 
 #[tauri::command]
@@ -261,6 +297,27 @@ fn show_shell_menu(app: AppHandle, path: String, extended: bool) -> Result<(), S
     })
     .map_err(|err| err.to_string())?;
     rx.recv().map_err(|_| "系统菜单没有打开。".to_string())?
+}
+
+pub(crate) fn import_dropped(app: &AppHandle, paths: &[String]) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let root = root_of(&state)?;
+    let mode = state
+        .config
+        .lock()
+        .map_err(|_| "设置正在被占用。".to_string())?
+        .drop_mode
+        .clone();
+    let surface = state
+        .surface
+        .lock()
+        .map_err(|_| "工作区正在切换。".to_string())?;
+    if surface.0.is_empty() {
+        return Err("还没有打开的工作区。".into());
+    }
+    model::import_paths(&root, &surface.0, &surface.1, paths, &mode)?;
+    let _ = app.emit("external-import", ());
+    Ok(())
 }
 
 fn root_of(state: &State<AppState>) -> Result<std::path::PathBuf, String> {
@@ -333,14 +390,56 @@ fn show_window(app: &AppHandle) {
     let _ = window.show();
     let _ = window.set_focus();
     let _ = window.set_always_on_top(true);
+    if let Ok(hwnd) = window.hwnd() {
+        drop_shelf::attach_main(hwnd.0 as isize);
+    }
+    if drop_shelf::external_drag() {
+        drop_shelf::present();
+    } else {
+        drop_shelf::hide();
+    }
     let _ = app.emit("workspace-shown", ());
 }
 
-fn hide_window(app: &AppHandle) {
+pub(crate) fn reveal_window(app: &AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let (x, y) = cursor_pos();
+    if let Ok(monitors) = window.available_monitors() {
+        for monitor in monitors {
+            let pos = monitor.position();
+            let size = monitor.size();
+            let right = pos.x + size.width as i32;
+            let bottom = pos.y + size.height as i32;
+            if x >= pos.x && x < right && y >= pos.y && y < bottom {
+                let _ = window.set_position(tauri::PhysicalPosition::new(pos.x, pos.y));
+                let _ = window.set_size(tauri::PhysicalSize::new(size.width, size.height));
+                break;
+            }
+        }
+    }
+    if let Ok(hwnd) = window.hwnd() {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNOACTIVATE};
+        unsafe {
+            let _ = ShowWindow(HWND(hwnd.0 as *mut std::ffi::c_void), SW_SHOWNOACTIVATE);
+        }
+    }
+    let _ = window.set_always_on_top(true);
+    if let Ok(hwnd) = window.hwnd() {
+        drop_shelf::attach_main(hwnd.0 as isize);
+    }
+    drop_shelf::present();
+    let _ = app.emit("workspace-shown", ());
+}
+
+pub(crate) fn hide_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.set_always_on_top(false);
         let _ = window.hide();
     }
+    drop_shelf::main_hidden();
 }
 
 fn toggle_window(app: &AppHandle) {
@@ -411,11 +510,78 @@ fn resolve_shortcut(path: &std::path::Path) -> Result<std::path::PathBuf, String
     }
 }
 
+fn drag_out_now(app: &AppHandle, path: &str) -> Result<bool, String> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
+    use windows::Win32::UI::WindowsAndMessaging::{SetWindowPos, HWND_NOTOPMOST, SWP_NOACTIVATE};
+    drop_shelf::set_internal_drag(true);
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.set_always_on_top(false);
+        if let Ok(hwnd) = window.hwnd() {
+            unsafe {
+                let _ = ReleaseCapture();
+                let _ = SetWindowPos(
+                    HWND(hwnd.0 as *mut std::ffi::c_void),
+                    Some(HWND_NOTOPMOST),
+                    -32000,
+                    -32000,
+                    200,
+                    200,
+                    SWP_NOACTIVATE,
+                );
+            }
+        }
+    }
+    let dropped = shell_drag(path);
+    drop_shelf::set_internal_drag(false);
+    match dropped {
+        Ok(true) => {
+            if let Some(window) = app.get_webview_window("main") {
+                if let Ok(hwnd) = window.hwnd() {
+                    yield_foreground(hwnd.0 as *mut std::ffi::c_void);
+                }
+            }
+            hide_window(app);
+            Ok(true)
+        }
+        Ok(false) => {
+            show_window(app);
+            Ok(false)
+        }
+        Err(err) => {
+            show_window(app);
+            Err(err)
+        }
+    }
+}
+
+fn yield_foreground(our: *mut std::ffi::c_void) {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetAncestor, GetCursorPos, SetForegroundWindow, WindowFromPoint, GA_ROOT,
+    };
+    unsafe {
+        let mut point = POINT::default();
+        let _ = GetCursorPos(&mut point);
+        let hit = WindowFromPoint(point);
+        if hit.0.is_null() {
+            return;
+        }
+        let root = GetAncestor(hit, GA_ROOT);
+        let target = if root.0.is_null() { hit } else { root };
+        if target.0.is_null() || target.0 == our {
+            return;
+        }
+        let _ = SetForegroundWindow(target);
+    }
+}
+
 fn shell_drag(path: &str) -> Result<bool, String> {
     use windows::Win32::System::Com::IDataObject;
     use windows::Win32::System::Ole::{
-        DoDragDrop, IDropSource, IDropSource_Impl, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_MOVE,
+        DoDragDrop, IDropSource, IDropSource_Impl, OleInitialize, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_MOVE,
     };
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, ReleaseCapture, VK_LBUTTON};
     use windows::Win32::UI::Shell::{BHID_DataObject, IShellItem, SHCreateItemFromParsingName};
     use windows::core::{implement, BOOL, HSTRING, HRESULT};
     use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
@@ -428,10 +594,11 @@ fn shell_drag(path: &str) -> Result<bool, String> {
             if escape_pressed.as_bool() {
                 return HRESULT(0x0004_0101);
             }
-            if (key_state.0 & 0x0001) == 0 {
-                return HRESULT(0x0004_0100);
+            let async_down = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } < 0;
+            if async_down || (key_state.0 & 0x0001) != 0 {
+                return HRESULT(0);
             }
-            HRESULT(0)
+            HRESULT(0x0004_0100)
         }
 
         fn GiveFeedback(&self, _effect: DROPEFFECT) -> HRESULT {
@@ -440,6 +607,12 @@ fn shell_drag(path: &str) -> Result<bool, String> {
     }
 
     unsafe {
+        if let Err(err) = OleInitialize(None) {
+            if err.code() != windows::Win32::Foundation::RPC_E_CHANGED_MODE {
+                return Err(format!("无法拖出文件：{err}"));
+            }
+        }
+        let _ = ReleaseCapture();
         let item: IShellItem = SHCreateItemFromParsingName(&HSTRING::from(path), None)
             .map_err(|err| format!("无法拖出文件：{err}"))?;
         let data: IDataObject = item
@@ -451,7 +624,9 @@ fn shell_drag(path: &str) -> Result<bool, String> {
         if result.is_err() {
             return Err(format!("无法拖出文件：{result}"));
         }
-        Ok(effect.0 != 0)
+        // 松手放到其他窗口后，即使对方没回报效果，也不要把本窗口再拉到前台。
+        let cancelled = result.0 as u32 == 0x0004_0101;
+        Ok(!cancelled && (result.0 as u32 == 0x0004_0100 || effect.0 != 0))
     }
 }
 
@@ -535,11 +710,16 @@ pub fn run() {
             let config = load_config(app.handle())?;
             app.manage(AppState {
                 config: Mutex::new(config.clone()),
+                surface: Mutex::new((String::new(), Vec::new())),
+                names: Mutex::new(Vec::new()),
             });
             if let Err(err) = register_shortcut(app.handle(), &config.shortcut) {
                 eprintln!("{err}");
             }
             setup_tray(app.handle())?;
+            if let Err(err) = drop_shelf::install(app.handle()) {
+                eprintln!("{err}");
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -561,6 +741,12 @@ pub fn run() {
             delete_entry,
             open_path,
             open_with,
+            workspace_names,
+            place_rail,
+            hover_workspace,
+            set_workspace_names,
+            set_active_surface,
+            clipboard_files,
             drag_file_out,
             file_icons,
             workspace_background,

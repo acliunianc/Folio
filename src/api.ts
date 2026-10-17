@@ -263,9 +263,24 @@ export async function openWith(appPath: string, filePath: string): Promise<void>
   return invoke("open_with", { appPath, filePath });
 }
 
-export async function dragFileOut(path: string): Promise<void> {
+export async function dragFileOut(path: string): Promise<boolean> {
+  if (!inTauri()) return false;
+  return invoke<boolean>("drag_file_out", { path });
+}
+
+export async function setWorkspaceNames(names: string[]): Promise<void> {
   if (!inTauri()) return;
-  return invoke("drag_file_out", { path });
+  return invoke("set_workspace_names", { names });
+}
+
+export async function setActiveSurface(workspace: string, folders: string[]): Promise<void> {
+  if (!inTauri()) return;
+  return invoke("set_active_surface", { workspace, folders });
+}
+
+export async function clipboardFiles(): Promise<string[]> {
+  if (!inTauri()) return [];
+  return invoke<string[]>("clipboard_files");
 }
 
 export async function readWorkspaceBackground(workspace: string): Promise<string | null> {

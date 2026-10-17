@@ -240,11 +240,6 @@ pub fn import_paths(
         if source.parent() == Some(dest_dir.as_path()) {
             continue;
         }
-        let mode = if is_installed_app(&source) {
-            "shortcut"
-        } else {
-            mode
-        };
         let file_name = source
             .file_name()
             .ok_or("无法识别文件名")?
@@ -321,6 +316,9 @@ pub fn group_items(
         return Err("需要两个项目才能成组。".into());
     }
     let dir = resolve_dir(root, workspace, folders)?;
+    if names.iter().any(|name| is_note(&dir, name)) {
+        return Err("便签只能放在工作区桌面，不能成组。".into());
+    }
     let group_name = unique_name(&dir, "分组", "");
     let group = dir.join(&group_name);
     fs::create_dir(&group).map_err(|err| err.to_string())?;
@@ -341,6 +339,9 @@ pub fn move_into(
     folder: &str,
 ) -> Result<(), String> {
     let dir = resolve_dir(root, workspace, folders)?;
+    if is_note(&dir, name) {
+        return Err("便签只能放在工作区桌面，不能放进文件夹。".into());
+    }
     let src = dir.join(clean_name(name)?);
     let folder = dir.join(clean_name(folder)?);
     if !folder.is_dir() {
@@ -362,6 +363,9 @@ pub fn move_entry(
     let to_dir = resolve_dir(root, to_workspace, to_folders)?;
     if from_dir == to_dir {
         return Ok(());
+    }
+    if !to_folders.is_empty() && is_note(&from_dir, name) {
+        return Err("便签只能放在工作区桌面，不能放进文件夹。".into());
     }
     let src = from_dir.join(clean_name(name)?);
     let dest = unique_dest(to_dir.join(src.file_name().unwrap_or_default()));
@@ -499,6 +503,10 @@ fn write_order(root: &Path, names: &[String]) -> Result<(), String> {
     fs::write(root.join(".order.json"), text).map_err(|err| err.to_string())
 }
 
+fn is_note(dir: &Path, name: &str) -> bool {
+    read_layout(dir).items.get(name).is_some_and(|place| place.note)
+}
+
 fn read_layout(dir: &Path) -> LayoutFile {
     let Ok(text) = fs::read_to_string(dir.join(".layout.json")) else {
         return LayoutFile::default();
@@ -537,12 +545,6 @@ fn dir_is_empty(path: &Path) -> bool {
     fs::read_dir(path)
         .map(|mut items| items.next().is_none())
         .unwrap_or(false)
-}
-
-fn is_installed_app(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
 }
 
 fn is_lnk(path: &Path) -> bool {

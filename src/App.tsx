@@ -15,7 +15,7 @@ import {
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import {
   createNote,
   createWorkspace,
@@ -32,7 +32,10 @@ import {
   moveInto,
   openPath,
   openWith,
+  clipboardFiles,
   dragFileOut,
+  setActiveSurface,
+  setWorkspaceNames,
   readWorkspaceBackground,
   saveWorkspaceBackground,
   clearWorkspaceBackground,
@@ -43,6 +46,7 @@ import {
 } from "./api";
 import { Board, snapIconSize } from "./Board";
 import { arrange, moveItem, packTopLeft, placePacked, resizeItem } from "./layout";
+import { WorkspaceRail } from "./WorkspaceRail";
 import type { Config, DropMode, FolderChild, GridItem, Placement } from "./types";
 
 const wallpaper = "/t01678398d736b184ed.jpg";
@@ -129,8 +133,16 @@ const alignByTopLeft: CollisionDetection = ({ collisionRect, droppableContainers
   } else {
     outsideCollision = null;
   }
+  const incomingEl = document.querySelector("[data-incoming]");
+  const incomingBox = incomingEl?.getBoundingClientRect();
+  const overIncoming = Boolean(
+    incomingBox && x >= incomingBox.left && x <= incomingBox.right && y >= incomingBox.top && y <= incomingBox.bottom,
+  );
   const hits = [];
   for (const container of droppableContainers) {
+    const node = container.node.current;
+    const inIncoming = node instanceof HTMLElement && Boolean(node.closest("[data-incoming]"));
+    if (overIncoming !== inIncoming) continue;
     const rect = droppableRects.get(container.id);
     const kind = (container.data.current as DragData | undefined)?.type;
     if (!rect || (kind !== "cell" && kind !== "workspace" && kind !== "parent")) continue;
@@ -150,6 +162,9 @@ const alignByTopLeft: CollisionDetection = ({ collisionRect, droppableContainers
   let bestDistance = Number.POSITIVE_INFINITY;
   for (const container of droppableContainers) {
     if ((container.data.current as DragData | undefined)?.type !== "cell") continue;
+    const node = container.node.current;
+    const inIncoming = node instanceof HTMLElement && Boolean(node.closest("[data-incoming]"));
+    if (overIncoming !== inIncoming) continue;
     const rect = droppableRects.get(container.id);
     if (!rect) continue;
     const distance = (collisionRect.left - rect.left) ** 2 + (collisionRect.top - rect.top) ** 2;
@@ -173,9 +188,12 @@ export default function App() {
   const [rows, setRows] = useState(4);
   const [folderGrid, setFolderGrid] = useState({ cols: 6, rows: 4 });
   const [icons, setIcons] = useState<Record<string, string>>({});
-  const [editing, setEditing] = useState(false);
+  const [batchEdit, setBatchEdit] = useState(false);
+  const [externalDrag, setExternalDrag] = useState(false);
+  const [edgeHint, setEdgeHint] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [menu, setMenu] = useState<{ x: number; y: number; item: string | null } | null>(null);
+  const [frequentMenu, setFrequentMenu] = useState<{ x: number; y: number; path: string } | null>(null);
   const [backgrounds, setBackgrounds] = useState<Record<string, string>>({});
   const [previews, setPreviews] = useState<Record<string, GridItem[]>>({});
   const [folderKids, setFolderKids] = useState<Record<string, FolderChild[]>>({});
@@ -183,6 +201,8 @@ export default function App() {
   const [dragX, setDragX] = useState(0);
   const [paging, setPaging] = useState(false);
   const [activeName, setActiveName] = useState<string | null>(null);
+  const [dragTarget, setDragTarget] = useState<string | null>(null);
+  const [incomingItems, setIncomingItems] = useState<GridItem[] | null>(null);
   const [overCell, setOverCell] = useState<{ col: number; row: number } | null>(null);
   const [ghost, setGhost] = useState<{ node: HTMLElement; width: number; height: number } | null>(null);
   const [overName, setOverName] = useState<string | null>(null);
@@ -194,6 +214,8 @@ export default function App() {
   const frame = useRef<HTMLDivElement>(null);
   const dragged = useRef(false);
   const handedOff = useRef(false);
+  const nativeDrag = useRef(false);
+  const edgeListen = useRef<(() => void) | null>(null);
   const groupPending = useRef<string | null>(null);
   const lastPointer = useRef({ x: 0, y: 0 });
   const groupTimer = useRef<number | null>(null);
@@ -201,6 +223,9 @@ export default function App() {
   const opening = useRef(false);
   const suppressDrop = useRef(false);
   const activeNameRef = useRef<string | null>(null);
+  const dragTargetRef = useRef<string | null>(null);
+  const goToRef = useRef<(next: number) => void>(() => {});
+  const workspacesRef = useRef<string[]>([]);
   const itemsRef = useRef(items);
   const colsRef = useRef(cols);
   const rowsRef = useRef(rows);
@@ -210,7 +235,7 @@ export default function App() {
   const carryListen = useRef<(() => void) | null>(null);
   const seenInside = useRef(false);
   const editingRef = useRef(false);
-  const holdToEdit = useRef(false);
+  const editing = batchEdit || activeName !== null || carry !== null;
   editingRef.current = editing;
   itemsRef.current = items;
   colsRef.current = cols;
@@ -238,6 +263,10 @@ export default function App() {
   const workspace = workspaces[index] ?? "";
   const needle = query.trim().toLowerCase();
   surface.current = { workspace, folders };
+  const dropModeRef = useRef(config?.dropMode ?? "move");
+  dropModeRef.current = config?.dropMode ?? "move";
+  const overviewRef = useRef(overview);
+  overviewRef.current = overview;
 
   useEffect(() => {
     let cancelled = false;
@@ -256,7 +285,7 @@ export default function App() {
 
   const sensors = useSensors(
     useSensor(PointerSensor, {
-      activationConstraint: editing ? { distance: 4 } : { delay: 500, tolerance: 6 },
+      activationConstraint: batchEdit ? { distance: 4 } : { delay: 280, tolerance: 6 },
     }),
   );
 
@@ -279,6 +308,8 @@ export default function App() {
       setBoardKey("");
     }
   }, [workspaces, workspace, folders, items]);
+  goToRef.current = goTo;
+  workspacesRef.current = workspaces;
 
   const reload = useCallback(async () => {
     const names = await listWorkspaces();
@@ -439,16 +470,93 @@ export default function App() {
     }).then((stop) => unlisten.push(stop));
     void getCurrentWebview()
       .onDragDropEvent((event) => {
-        if (event.payload.type !== "drop") return;
+        if (event.payload.type === "enter" || event.payload.type === "over") {
+          setExternalDrag(true);
+          return;
+        }
+        setExternalDrag(false);
+        if (event.payload.type !== "drop" || nativeDrag.current) return;
         const current = surface.current;
-        if (!current.workspace) return;
+        if (!current.workspace || event.payload.paths.length === 0) return;
+        boardCache.current.delete(storageKey(current.workspace, current.folders));
         void importPaths(current.workspace, current.folders, event.payload.paths, config?.dropMode ?? "move")
           .then(() => loadBoard(current.workspace, current.folders, measureRows()))
           .catch(showError);
       })
       .then((stop) => unlisten.push(stop));
+    void listen<boolean>("external-drag", (event) => {
+      nativeDrag.current = event.payload;
+      setExternalDrag(event.payload);
+    }).then((stop) => unlisten.push(stop));
+    void listen<string>("app-error", (event) => showError(new Error(event.payload))).then((stop) => unlisten.push(stop));
+    void listen<string>("activate-workspace", (event) => {
+      const next = workspacesRef.current.indexOf(event.payload);
+      if (next < 0) return;
+      setOverview(false);
+      goToRef.current(next);
+    }).then((stop) => unlisten.push(stop));
+    void listen("external-import", () => {
+      const current = surface.current;
+      if (!current.workspace) return;
+      boardCache.current.delete(storageKey(current.workspace, current.folders));
+      void loadBoard(current.workspace, current.folders, measureRows()).catch(showError);
+    }).then((stop) => unlisten.push(stop));
     return () => unlisten.forEach((stop) => stop());
   }, [config?.dropMode, loadBoard, showError]);
+
+  useEffect(() => {
+    if (!inTauri()) return;
+    void setActiveSurface(workspace, folders);
+  }, [workspace, folders]);
+
+  useEffect(() => {
+    if (!inTauri()) return;
+    void setWorkspaceNames(workspaces);
+  }, [workspaces]);
+
+  useEffect(() => {
+    if (!dragTarget || dragTarget === workspace) {
+      setIncomingItems(null);
+      return;
+    }
+    const cached = boardCache.current.get(storageKey(dragTarget, [])) ?? previewsRef.current[dragTarget];
+    if (cached) {
+      setIncomingItems(cached);
+      return;
+    }
+    setIncomingItems([]);
+    let cancel = false;
+    void listDir(dragTarget, []).then((listing) => {
+      if (cancel) return;
+      setIncomingItems(arrange(listing.entries, listing.layout, cols, rows).items);
+    }).catch(() => {
+      if (!cancel) setIncomingItems([]);
+    });
+    return () => {
+      cancel = true;
+    };
+  }, [dragTarget, workspace, cols, rows]);
+
+  useEffect(() => {
+    const paste = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "v") return;
+      const target = event.target;
+      if (target instanceof HTMLElement && target.closest("input, textarea")) return;
+      const current = surface.current;
+      if (!current.workspace || overviewRef.current) return;
+      event.preventDefault();
+      void clipboardFiles()
+        .then(async (paths) => {
+          if (paths.length === 0) return;
+          await importPaths(current.workspace, current.folders, paths, dropModeRef.current);
+          boardCache.current.delete(storageKey(current.workspace, current.folders));
+          await loadBoard(current.workspace, current.folders, measureRows());
+        })
+        .catch(showError);
+    };
+    window.addEventListener("keydown", paste);
+    return () => window.removeEventListener("keydown", paste);
+  }, [loadBoard, showError]);
 
   useEffect(() => {
     const node = frame.current;
@@ -491,11 +599,14 @@ export default function App() {
   }, [zoom]);
 
   useEffect(() => {
-    if (!menu) return;
-    const close = () => setMenu(null);
+    if (!menu && !frequentMenu) return;
+    const close = () => {
+      setMenu(null);
+      setFrequentMenu(null);
+    };
     window.addEventListener("pointerdown", close);
     return () => window.removeEventListener("pointerdown", close);
-  }, [menu]);
+  }, [menu, frequentMenu]);
 
   useEffect(() => {
     if (!toast) return;
@@ -546,20 +657,42 @@ export default function App() {
     setOverName(null);
     setOverCell(null);
     setGhost(null);
+    setEdgeHint(false);
+    const targetWorkspace = dragTargetRef.current;
+    dragTargetRef.current = null;
+    setDragTarget(null);
+    setIncomingItems(null);
+    edgeListen.current?.();
+    edgeListen.current = null;
     if (groupTimer.current != null) window.clearTimeout(groupTimer.current);
     groupTimer.current = null;
     groupPending.current = null;
     const exported = handedOff.current;
     handedOff.current = false;
     if (suppressDrop.current) return;
-    const hold = holdToEdit.current;
-    holdToEdit.current = false;
     setActiveName(null);
+    activeNameRef.current = null;
     window.setTimeout(() => {
       dragged.current = false;
     }, 80);
-    try {
     if (exported || !active || active.type !== "item" || !workspace) return;
+    if (targetWorkspace && targetWorkspace !== workspace) {
+      const spot = over?.type === "cell" ? over : null;
+      boardCache.current.delete(storageKey(workspace, folders));
+      boardCache.current.delete(storageKey(targetWorkspace, []));
+      await moveEntry(workspace, folders, active.name, targetWorkspace, []);
+      const listing = await listDir(targetWorkspace, []);
+      let next = arrange(listing.entries, listing.layout, cols, rows).items;
+      if (spot) next = moveItem(next, active.name, spot.col, spot.row, cols, rows);
+      await saveLayout(targetWorkspace, [], toLayout(next));
+      boardCache.current.set(storageKey(targetWorkspace, []), next);
+      const nextIndex = workspaces.indexOf(targetWorkspace);
+      if (nextIndex >= 0) goTo(nextIndex);
+      boardCache.current.delete(storageKey(workspace, folders));
+      setItems(next);
+      setBoardKey(storageKey(targetWorkspace, []));
+      return;
+    }
     if (folders.length > 0 && itemOutsidePanel(active.name)) {
       const parentPath = folders.slice(0, -1);
       suppressDrop.current = true;
@@ -596,9 +729,14 @@ export default function App() {
         );
         if (host && dragging && isApp(host) && dragging.kind === "file" && !dragging.note) {
           await openWith(host.path, dragging.path);
-        } else if (host?.kind === "folder") {
+        } else if (host?.kind === "folder" && !dragging?.note) {
           await moveInto(workspace, folders, active.name, host.name);
           await loadBoard(workspace, folders, measureRows());
+        } else if (dragging?.note && folders.length > 0) {
+          boardCache.current.delete(storageKey(workspace, []));
+          await moveEntry(workspace, folders, active.name, workspace, []);
+          setFolders([]);
+          await loadBoard(workspace, [], measureRows());
         } else if (folders.length > 0) {
           const next = placePacked(items, active.name, over.col, over.row, folderColsRef.current);
           await persist(next);
@@ -610,7 +748,7 @@ export default function App() {
         const target = items.find((item) => item.name === over.name);
         if (target && dragging && isApp(target) && dragging.kind === "file" && !dragging.note) {
           await openWith(target.path, dragging.path);
-        } else if (target?.kind === "folder") {
+        } else if (target?.kind === "folder" && !dragging?.note) {
           await moveInto(workspace, folders, active.name, over.name);
           await loadBoard(workspace, folders, measureRows());
         }
@@ -627,17 +765,34 @@ export default function App() {
     } catch (error) {
       showError(error);
     }
-    } finally {
-      if (hold) setEditing(false);
-    }
+  }
+
+  function onDragCancel() {
+    setOverName(null);
+    setOverCell(null);
+    setGhost(null);
+    setEdgeHint(false);
+    dragTargetRef.current = null;
+    setDragTarget(null);
+    setIncomingItems(null);
+    edgeListen.current?.();
+    edgeListen.current = null;
+    handedOff.current = false;
+    groupPending.current = null;
+    if (groupTimer.current != null) window.clearTimeout(groupTimer.current);
+    groupTimer.current = null;
+    if (suppressDrop.current || opening.current) return;
+    setActiveName(null);
+    activeNameRef.current = null;
+    window.setTimeout(() => {
+      dragged.current = false;
+    }, 80);
   }
 
   function onDragStart(event: DragStartEvent) {
     const data = event.active.data.current as DragData | undefined;
     if (data?.type === "item") {
       dragged.current = true;
-      holdToEdit.current = !editingRef.current;
-      setEditing(true);
       setActiveName(data.name);
       activeNameRef.current = data.name;
       setGhost(snapshotItem(data.name));
@@ -646,13 +801,56 @@ export default function App() {
       if (event.activatorEvent instanceof MouseEvent) {
         lastPointer.current = { x: event.activatorEvent.clientX, y: event.activatorEvent.clientY };
       }
+      edgeListen.current?.();
+      const track = (ev: PointerEvent) => {
+        lastPointer.current = { x: ev.clientX, y: ev.clientY };
+        const under = document.elementFromPoint(ev.clientX, ev.clientY);
+        const workspaceHit = under instanceof Element ? under.closest("[data-workspace-name]") : null;
+        const nextTarget = workspaceHit?.getAttribute("data-workspace-name") ?? null;
+        if (nextTarget) {
+          if (nextTarget !== dragTargetRef.current) {
+            dragTargetRef.current = nextTarget;
+            setDragTarget(nextTarget);
+          }
+          if (nextTarget !== surface.current.workspace) armOpen(null);
+        } else if (
+          !(under instanceof Element && under.closest("[data-incoming], [data-workspace-bar]")) &&
+          dragTargetRef.current
+        ) {
+          dragTargetRef.current = null;
+          setDragTarget(null);
+        }
+        if (handedOff.current || !inTauri() || opening.current) return;
+        if (ev.clientY < 72 || (under instanceof Element && under.closest("[data-workspace-bar]"))) {
+          setEdgeHint(false);
+          return;
+        }
+        const dragging = itemsRef.current.find((item) => item.name === data.name);
+        if (!dragging || dragging.note) return;
+        const atEdge =
+          ev.clientX < 24 ||
+          ev.clientY < 24 ||
+          ev.clientX > window.innerWidth - 24 ||
+          ev.clientY > window.innerHeight - 24;
+        setEdgeHint((current) => (current === atEdge ? current : atEdge));
+        if (!atEdge) return;
+        handedOff.current = true;
+        setEdgeHint(false);
+        setActiveName(null);
+        activeNameRef.current = null;
+        void dragFileOut(dragging.path).catch(showError);
+      };
+      window.addEventListener("pointermove", track);
+      edgeListen.current = () => window.removeEventListener("pointermove", track);
     }
   }
 
   function armOpen(name: string | null) {
-    if (carryRef.current && name) {
+    const dragging = itemsRef.current.find((item) => item.name === activeNameRef.current);
+    if (dragging?.note) name = null;
+    if (name) {
       const host = itemsRef.current.find((item) => item.name === name);
-      if (!host || host.kind !== "folder") name = null;
+      if (!host || host.note || (carryRef.current && host.kind !== "folder")) name = null;
     }
     if (opening.current || name === groupPending.current) return;
     if (groupTimer.current != null) window.clearTimeout(groupTimer.current);
@@ -727,6 +925,8 @@ export default function App() {
         spot.col < item.col + item.spanCol &&
         spot.row < item.row + item.spanRow,
     );
+    const dragging = itemsRef.current.find((item) => item.name === name);
+    if (dragging?.note || host?.note) return null;
     return host && !isApp(host) ? host.name : null;
   }
 
@@ -763,7 +963,8 @@ export default function App() {
     if (opening.current || !workspace) return;
     const name = activeNameRef.current;
     const host = itemsRef.current.find((item) => item.name === targetName);
-    if (!name || !host || host.name === name || isApp(host)) return;
+    const dragging = itemsRef.current.find((item) => item.name === name);
+    if (!name || !host || host.name === name || isApp(host) || host.note || dragging?.note) return;
     opening.current = true;
     suppressDrop.current = true;
     seenInside.current = false;
@@ -798,10 +999,8 @@ export default function App() {
       await loadBoard(workspace, nextPath, measureRows());
       if (!session) {
         suppressDrop.current = false;
-        if (holdToEdit.current) {
-          holdToEdit.current = false;
-          setEditing(false);
-        }
+        setActiveName(null);
+        activeNameRef.current = null;
         return;
       }
       if (pointerUp.event) await finishCarry(pointerUp.event.clientX, pointerUp.event.clientY, session);
@@ -809,10 +1008,8 @@ export default function App() {
     } catch (error) {
       showError(error);
       suppressDrop.current = false;
-      if (holdToEdit.current) {
-        holdToEdit.current = false;
-        setEditing(false);
-      }
+      setActiveName(null);
+      activeNameRef.current = null;
     } finally {
       window.removeEventListener("pointerup", onUp, true);
       opening.current = false;
@@ -848,10 +1045,8 @@ export default function App() {
       await loadBoard(workspace, parent, measureRows());
       if (!session) {
         suppressDrop.current = false;
-        if (holdToEdit.current) {
-          holdToEdit.current = false;
-          setEditing(false);
-        }
+        setActiveName(null);
+        activeNameRef.current = null;
         return;
       }
       if (pointerUp.event) await finishCarry(pointerUp.event.clientX, pointerUp.event.clientY, session);
@@ -859,10 +1054,8 @@ export default function App() {
     } catch (error) {
       showError(error);
       suppressDrop.current = false;
-      if (holdToEdit.current) {
-        holdToEdit.current = false;
-        setEditing(false);
-      }
+      setActiveName(null);
+      activeNameRef.current = null;
     } finally {
       window.removeEventListener("pointerup", onUp, true);
       opening.current = false;
@@ -898,10 +1091,6 @@ export default function App() {
       showError(error);
     } finally {
       suppressDrop.current = false;
-      if (holdToEdit.current) {
-        holdToEdit.current = false;
-        setEditing(false);
-      }
     }
   }
 
@@ -911,21 +1100,45 @@ export default function App() {
       lastPointer.current = { x: source.clientX + event.delta.x, y: source.clientY + event.delta.y };
     }
     watchLeave();
-    if (handedOff.current || !inTauri()) return;
-    const data = event.active.data.current as DragData | undefined;
-    if (data?.type !== "item") return;
-    const dragging = items.find((item) => item.name === data.name);
-    if (!dragging || dragging.kind !== "file" || dragging.note) return;
-    const x = lastPointer.current.x;
-    const y = lastPointer.current.y;
-    if (x > 12 && y > 12 && x < window.innerWidth - 12 && y < window.innerHeight - 12) return;
-    handedOff.current = true;
-    void dragFileOut(dragging.path).catch(showError);
+  }
+
+  function beginExport(event: { button: number; clientX: number; clientY: number }, path: string) {
+    if (!inTauri() || event.button !== 0) return;
+    const startX = event.clientX;
+    const startY = event.clientY;
+    const move = (ev: PointerEvent) => {
+      if (editingRef.current) return;
+      if (Math.hypot(ev.clientX - startX, ev.clientY - startY) < 12) return;
+      stop();
+      dragged.current = true;
+      handedOff.current = true;
+      void dragFileOut(path)
+        .catch(showError)
+        .finally(() => {
+          window.setTimeout(() => {
+            dragged.current = false;
+            handedOff.current = false;
+          }, 120);
+        });
+    };
+    const stop = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+    };
+    const up = () => stop();
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
   }
 
   function onDragOver(event: DragOverEvent) {
     const over = event.over?.data.current as DragData | undefined;
     const active = event.active.data.current as DragData | undefined;
+    const targetWorkspace = dragTargetRef.current;
+    if (targetWorkspace && targetWorkspace !== surface.current.workspace) {
+      setOverCell(null);
+      armOpen(null);
+      return;
+    }
     const dragging = active?.type === "item" ? items.find((item) => item.name === active.name) : undefined;
     if (over?.type === "cell" && dragging && over.col + dragging.spanCol <= cols && over.row + dragging.spanRow <= rows) {
       setOverCell({ col: over.col, row: over.row });
@@ -968,7 +1181,7 @@ export default function App() {
   }
 
   function showOverview() {
-    setEditing(false);
+    setBatchEdit(false);
     setFolders([]);
     setQuery("");
     setMenu(null);
@@ -1038,13 +1251,17 @@ export default function App() {
     goTo(workspaceIndex);
   }
 
-  async function addFiles() {
+  async function addPicked(directory: boolean) {
     if (!workspace) return;
     if (!inTauri()) {
-      showError(new Error("从资源管理器把文件拖进来，或在桌面版里选择文件。"));
+      showError(new Error("请在桌面版里放入文件。"));
       return;
     }
-    const picked = await open({ multiple: true, directory: false, title: "放入工作区" });
+    const picked = await open({
+      multiple: true,
+      directory,
+      title: directory ? "放入文件夹" : "放入文件",
+    });
     if (!picked) return;
     const paths = Array.isArray(picked) ? picked : [picked];
     await importPaths(workspace, folders, paths, config?.dropMode ?? "move");
@@ -1059,6 +1276,7 @@ export default function App() {
       onDragStart={onDragStart}
       onDragMove={onDragMove}
       onDragOver={onDragOver}
+      onDragCancel={onDragCancel}
       onDragEnd={(event) => void onDragEnd(event)}
     >
       <main
@@ -1077,7 +1295,7 @@ export default function App() {
           return;
         }
         const width = 196;
-        const height = picked ? 248 : 208;
+        const height = picked ? 320 : 280;
         setMenu({
           x: Math.max(8, Math.min(event.clientX, window.innerWidth - width - 8)),
           y: Math.max(8, Math.min(event.clientY, window.innerHeight - height - 8)),
@@ -1086,11 +1304,14 @@ export default function App() {
       }}
         onKeyDown={(event) => {
           if (event.key === "Escape") {
-            if (menu) setMenu(null);
+            if (menu || frequentMenu) {
+              setMenu(null);
+              setFrequentMenu(null);
+            }
             else if (query) setQuery("");
             else if (overview) setOverview(false);
             else if (folders.length) setFolders((current) => current.slice(0, -1));
-            else setEditing(false);
+            else setBatchEdit(false);
           }
           if (event.key === "ArrowRight" && !overview && !editing && folders.length === 0) {
             goTo(Math.min(workspaces.length - 1, index + 1));
@@ -1101,17 +1322,57 @@ export default function App() {
         }}
         tabIndex={0}
       >
+        {externalDrag && workspace && (
+          <div className="pointer-events-none absolute inset-0 z-40 grid place-items-center bg-black/45">
+            <div className="rounded-[28px] bg-[#1c1c1c]/90 px-8 py-5 text-lg text-[#f4f1ea] shadow-[0_16px_40px_rgba(0,0,0,0.35)]">
+              松开放入「{folders.length > 0 ? folders[folders.length - 1] : workspace}」
+            </div>
+          </div>
+        )}
+        {edgeHint && (
+          <div className="pointer-events-none absolute bottom-28 left-1/2 z-30 -translate-x-1/2 rounded-full bg-black/60 px-4 py-2 text-sm text-white">
+            拖到屏幕边缘，即可放到其他窗口
+          </div>
+        )}
         <header className="pointer-events-none absolute inset-x-0 top-0 z-20 flex justify-center px-6 pt-5 pb-2">
-          <label className="pointer-events-auto flex h-11 w-[min(440px,72vw)] items-center gap-3 rounded-full bg-black/40 px-4 text-white/70">
-            <SearchIcon />
-            <input
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder="输入以搜索"
-              className="w-full bg-transparent text-[15px] text-white outline-none placeholder:text-white/45"
-            />
-          </label>
+          {activeName ? (
+            <WorkspaceRail names={workspaces} current={dragTarget ?? workspace} />
+          ) : (
+            <label className="pointer-events-auto flex h-11 w-[min(440px,72vw)] items-center gap-3 rounded-full bg-black/40 px-4 text-white/70">
+              <SearchIcon />
+              <input
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                placeholder="输入以搜索"
+                className="w-full bg-transparent text-[15px] text-white outline-none placeholder:text-white/45"
+              />
+            </label>
+          )}
         </header>
+        {activeName && dragTarget && dragTarget !== workspace && incomingItems && (
+          <div
+            data-incoming
+            className="absolute inset-0 z-10 px-8 pt-20 pb-24"
+            style={{ background: `#1a1916 url("${wallpaperOf(dragTarget)}") center / cover no-repeat` }}
+          >
+            <Board
+              items={incomingItems}
+              cols={cols}
+              rows={rows}
+              editing
+              icons={icons}
+              folderKids={{}}
+              activeName={null}
+              overName={null}
+              footprint={null}
+              idPrefix="incoming:"
+              onOpen={() => {}}
+              onRemove={() => {}}
+              onNote={() => {}}
+              onResize={() => {}}
+            />
+          </div>
+        )}
 
         <div
           ref={frame}
@@ -1130,8 +1391,8 @@ export default function App() {
             const pointerId = event.pointerId;
             let moved = false;
             const timer = window.setTimeout(() => {
-              if (!moved) setEditing(true);
-            }, 500);
+              if (!moved) setBatchEdit(true);
+            }, 280);
             const move = (ev: PointerEvent) => {
               const dx = ev.clientX - startX;
               if (Math.abs(dx) > 8) {
@@ -1214,6 +1475,7 @@ export default function App() {
                         items={items.filter((item) => item.name.toLowerCase().includes(needle))}
                         icons={icons}
                         onOpen={openItem}
+                        onExport={(item, event) => beginExport(event, item.path)}
                       />
                     ) : (
                     <div className="h-full px-8 pt-20 pb-24">
@@ -1290,11 +1552,15 @@ export default function App() {
           )}
           {editing && workspace && (
           <div className="absolute bottom-24 left-1/2 z-20 flex -translate-x-1/2 items-center gap-2 rounded-full bg-black/50 px-3 py-2 backdrop-blur">
-            <DockButton onClick={() => void addFiles().catch(showError)}>添加文件</DockButton>
+            <DockButton onClick={() => void addPicked(false).catch(showError)}>放入文件</DockButton>
+            <DockButton onClick={() => void addPicked(true).catch(showError)}>放入文件夹</DockButton>
             <DockButton
               onClick={() =>
-                void createNote(workspace, folders)
-                  .then(() => loadBoard(workspace, folders, measureRows()))
+                void createNote(workspace, [])
+                  .then(() => {
+                    setFolders([]);
+                    return loadBoard(workspace, [], measureRows());
+                  })
                   .catch(showError)
               }
             >
@@ -1308,7 +1574,7 @@ export default function App() {
                     void deleteWorkspace(workspace)
                       .then(async () => {
                         setFolders([]);
-                        setEditing(false);
+                        setBatchEdit(false);
                         await reload();
                       })
                       .catch(showError);
@@ -1318,7 +1584,7 @@ export default function App() {
             >
               删除工作区
             </DockButton>
-            <DockButton onClick={() => setEditing(false)}>完成</DockButton>
+            <DockButton onClick={() => setBatchEdit(false)}>完成</DockButton>
           </div>
         )}
         </div>
@@ -1345,7 +1611,21 @@ export default function App() {
                 type="button"
                 title={item.name}
                 className="grid h-12 w-12 shrink-0 place-items-center rounded-2xl hover:bg-white/10"
+                onContextMenu={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  const width = 168;
+                  const height = 44;
+                  setMenu(null);
+                  setFrequentMenu({
+                    x: Math.max(8, Math.min(event.clientX, window.innerWidth - width - 8)),
+                    y: Math.max(8, event.clientY - height - 6),
+                    path: item.path,
+                  });
+                }}
+                onPointerDown={(event) => beginExport(event, item.path)}
                 onClick={() => {
+                  if (dragged.current) return;
                   const workspaceIndex = workspaces.indexOf(item.workspace);
                   if (workspaceIndex >= 0) goTo(workspaceIndex);
                   if (item.kind === "folder") {
@@ -1440,6 +1720,24 @@ export default function App() {
           </FolderLayer>
         )}
 
+        {frequentMenu && (
+          <div
+            className="absolute z-50 w-40 overflow-hidden rounded-2xl border border-white/15 bg-[#1c1c1c]/90 py-1 text-sm text-[#f4f1ea] shadow-[0_16px_40px_rgba(0,0,0,0.35)] backdrop-blur-xl"
+            style={{ left: frequentMenu.x, top: frequentMenu.y }}
+            onPointerDown={(event) => event.stopPropagation()}
+          >
+            <MenuItem
+              label="从常用中移除"
+              onClick={() => {
+                const next = frequent.filter((entry) => entry.path !== frequentMenu.path);
+                localStorage.setItem(FREQUENT_KEY, JSON.stringify(next));
+                setFrequent(next);
+                setFrequentMenu(null);
+              }}
+            />
+          </div>
+        )}
+
         {menu && (
           <div
             className="absolute z-50 w-48 overflow-hidden rounded-2xl border border-white/15 bg-[#1c1c1c]/90 py-1 text-sm text-[#f4f1ea] shadow-[0_16px_40px_rgba(0,0,0,0.35)] backdrop-blur-xl"
@@ -1457,6 +1755,20 @@ export default function App() {
               />
             )}
             <MenuItem
+              label="放入文件"
+              onClick={() => {
+                setMenu(null);
+                void addPicked(false).catch(showError);
+              }}
+            />
+            <MenuItem
+              label="放入文件夹"
+              onClick={() => {
+                setMenu(null);
+                void addPicked(true).catch(showError);
+              }}
+            />
+            <MenuItem
               label="刷新"
               onClick={() => {
                 setMenu(null);
@@ -1464,9 +1776,9 @@ export default function App() {
               }}
             />
             <MenuItem
-              label={editing ? "完成编辑" : "编辑布局"}
+              label={batchEdit ? "完成编辑" : "编辑布局"}
               onClick={() => {
-                setEditing((current) => !current);
+                setBatchEdit((current) => !current);
                 setMenu(null);
               }}
             />
@@ -1535,7 +1847,7 @@ export default function App() {
           </div>
         )}
       </main>
-      <DragOverlay style={ghost ? { width: ghost.width, height: ghost.height } : undefined}>
+      <DragOverlay className="pointer-events-none" style={ghost ? { width: ghost.width, height: ghost.height } : undefined}>
         {ghost ? <DragGhost node={ghost.node} /> : null}
       </DragOverlay>
       {carry && (
@@ -1640,10 +1952,12 @@ function SearchResults({
   items,
   icons,
   onOpen,
+  onExport,
 }: {
   items: GridItem[];
   icons: Record<string, string>;
   onOpen: (item: GridItem) => void;
+  onExport: (item: GridItem, event: { button: number; clientX: number; clientY: number }) => void;
 }) {
   if (items.length === 0) {
     return <div className="grid h-full place-items-center text-white/45">没有匹配的内容</div>;
@@ -1656,6 +1970,7 @@ function SearchResults({
           type="button"
           data-item
           className="flex w-24 flex-col items-center gap-2"
+          onPointerDown={(event) => onExport(item, event)}
           onClick={() => onOpen(item)}
         >
           {icons[item.path] ? (
@@ -1704,16 +2019,27 @@ function WorkspaceOverview({
   onCreate: () => void;
 }) {
   const scroller = useRef<HTMLDivElement>(null);
+  const suppressClick = useRef(false);
+  const coast = useRef<number | null>(null);
   const cardWidth = Math.max(280, stage.width * 0.62);
   const cardHeight = Math.max(180, stage.height * 0.62);
   const scale = stage.width > 0 ? cardWidth / stage.width : 0.62;
   const gutter = Math.max(24, (stage.width - cardWidth) / 2);
+  function stopCoast() {
+    if (coast.current != null) cancelAnimationFrame(coast.current);
+    coast.current = null;
+  }
+  function limitScroll(root: HTMLDivElement, next: number) {
+    const max = Math.max(0, root.scrollWidth - root.clientWidth);
+    return Math.min(max, Math.max(0, next));
+  }
   useEffect(() => {
     const root = scroller.current;
     const current = root?.querySelector("[data-current='true']");
     if (!(root && current instanceof HTMLElement)) return;
     root.scrollLeft = current.offsetLeft - (root.clientWidth - current.offsetWidth) / 2;
   }, [activeIndex, names.length, cardWidth]);
+  useEffect(() => () => stopCoast(), []);
   useEffect(() => {
     const root = scroller.current;
     if (!root) return;
@@ -1722,17 +2048,80 @@ function WorkspaceOverview({
       const delta = (Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY) * unit;
       if (delta === 0 || root.scrollWidth <= root.clientWidth) return;
       event.preventDefault();
-      root.scrollLeft = Math.min(root.scrollWidth - root.clientWidth, Math.max(0, root.scrollLeft + delta));
+      stopCoast();
+      root.scrollLeft = limitScroll(root, root.scrollLeft + delta);
     };
     root.addEventListener("wheel", slide, { passive: false });
     return () => root.removeEventListener("wheel", slide);
   }, []);
+  function onPanStart(event: ReactPointerEvent<HTMLDivElement>) {
+    if (event.button !== 0) return;
+    const root = scroller.current;
+    if (!root || root.scrollWidth <= root.clientWidth) return;
+    stopCoast();
+    suppressClick.current = false;
+    const startX = event.clientX;
+    let lastX = event.clientX;
+    let lastTime = performance.now();
+    let velocity = 0;
+    const move = (ev: PointerEvent) => {
+      const now = performance.now();
+      const dx = ev.clientX - lastX;
+      const dt = Math.max(8, now - lastTime);
+      if (Math.abs(ev.clientX - startX) > 6) suppressClick.current = true;
+      if (suppressClick.current) {
+        root.scrollLeft = limitScroll(root, root.scrollLeft - dx);
+        velocity = velocity * 0.55 + (-dx / dt) * 0.45;
+      }
+      lastX = ev.clientX;
+      lastTime = now;
+    };
+    const end = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", end);
+      window.removeEventListener("pointercancel", end);
+      if (performance.now() - lastTime > 60) velocity = 0;
+      const max = Math.max(0, root.scrollWidth - root.clientWidth);
+      let speed = velocity;
+      let previous = performance.now();
+      const step = (now: number) => {
+        const dt = Math.min(34, now - previous);
+        previous = now;
+        speed *= Math.exp(-3.4 * dt / 1000);
+        const next = root.scrollLeft + speed * dt;
+        if (next <= 0 || next >= max) {
+          root.scrollLeft = Math.min(max, Math.max(0, next));
+          coast.current = null;
+          return;
+        }
+        root.scrollLeft = next;
+        if (Math.abs(speed) < 0.02) {
+          coast.current = null;
+          return;
+        }
+        coast.current = requestAnimationFrame(step);
+      };
+      if (suppressClick.current && Math.abs(speed) > 0.08) coast.current = requestAnimationFrame(step);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", end);
+    window.addEventListener("pointercancel", end);
+  }
+  function openCard(event: ReactMouseEvent<HTMLButtonElement>, open: () => void) {
+    if (suppressClick.current) {
+      event.preventDefault();
+      suppressClick.current = false;
+      return;
+    }
+    open();
+  }
   return (
     <div className="absolute inset-0 z-10 flex items-center">
       <div
         ref={scroller}
-        className="scroll-hidden flex h-full w-full items-center gap-8 overflow-x-auto"
-        style={{ paddingLeft: gutter, paddingRight: gutter }}
+        className="scroll-hidden flex h-full w-full cursor-grab items-center gap-8 overflow-x-auto active:cursor-grabbing"
+        style={{ paddingLeft: gutter, paddingRight: gutter, touchAction: "none" }}
+        onPointerDown={onPanStart}
       >
         {names.map((name, workspaceIndex) => (
           <button
@@ -1742,8 +2131,10 @@ function WorkspaceOverview({
             className="relative shrink-0 overflow-hidden rounded-[18px] text-left shadow-[0_24px_70px_rgba(0,0,0,0.38)] ring-1 ring-white/30"
             style={{ width: cardWidth, height: cardHeight }}
             onClick={(event) => {
-              const preview = event.currentTarget.querySelector("[data-workspace-preview]");
-              if (preview instanceof HTMLElement) onOpen(workspaceIndex, preview);
+              openCard(event, () => {
+                const preview = event.currentTarget.querySelector("[data-workspace-preview]");
+                if (preview instanceof HTMLElement) onOpen(workspaceIndex, preview);
+              });
             }}
           >
             <div
@@ -1782,7 +2173,7 @@ function WorkspaceOverview({
           title="新建工作区"
           className="grid shrink-0 place-items-center rounded-[18px] border border-dashed border-white/40 bg-white/10 text-4xl text-white/80"
           style={{ width: cardWidth, height: cardHeight }}
-          onClick={onCreate}
+          onClick={(event) => openCard(event, onCreate)}
         >
           +
         </button>
