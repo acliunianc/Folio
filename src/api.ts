@@ -14,6 +14,7 @@ const mock = {
     root: "C:\\Users\\示例\\Documents\\工作区",
     dropMode: "move" as DropMode,
     shortcut: "F7",
+    launchAtLogin: false,
   },
   backgrounds: {} as Record<string, string>,
   order: ["采购项目", "设计稿"],

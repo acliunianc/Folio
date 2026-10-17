@@ -10,6 +10,8 @@ pub struct Config {
     pub root: String,
     pub drop_mode: String,
     pub shortcut: String,
+    #[serde(default)]
+    pub launch_at_login: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +68,7 @@ pub fn default_config() -> Config {
         root: default_root().to_string_lossy().to_string(),
         drop_mode: "move".to_string(),
         shortcut: "F7".to_string(),
+        launch_at_login: false,
     }
 }
 

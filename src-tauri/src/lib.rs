@@ -44,8 +44,14 @@ fn set_config(app: AppHandle, state: State<AppState>, next: Config) -> Result<Co
     let new_root = std::path::PathBuf::from(&next.root);
     model::change_root(&old_root, &new_root)?;
     let previous_shortcut = config.shortcut.clone();
+    let previous_launch = config.launch_at_login;
     *config = next;
     if let Err(err) = save_config(&app, &config) {
+        return Err(err);
+    }
+    if let Err(err) = set_launch_at_login(config.launch_at_login) {
+        config.launch_at_login = previous_launch;
+        let _ = save_config(&app, &config);
         return Err(err);
     }
     if config.shortcut != previous_shortcut {
@@ -344,6 +350,44 @@ fn load_config(app: &AppHandle) -> Result<Config, String> {
     std::fs::create_dir_all(&config.root).map_err(|err| err.to_string())?;
     save_config(app, &config)?;
     Ok(config)
+}
+
+fn set_launch_at_login(enabled: bool) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ,
+    };
+
+    const NAME: windows::core::PCWSTR = windows::core::w!("工作区");
+    unsafe {
+        let mut key = HKEY::default();
+        let status = RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            windows::core::w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run"),
+            Some(0),
+            KEY_SET_VALUE,
+            &mut key,
+        );
+        if status != ERROR_SUCCESS {
+            return Err("无法写入开机启动项。".into());
+        }
+        let result = if enabled {
+            let exe = std::env::current_exe().map_err(|err| format!("找不到程序位置：{err}"))?;
+            let quoted = format!("\"{}\"", exe.display());
+            let wide: Vec<u16> = std::ffi::OsStr::new(&quoted).encode_wide().chain(std::iter::once(0)).collect();
+            let bytes: Vec<u8> = wide.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+            RegSetValueExW(key, NAME, Some(0), REG_SZ, Some(&bytes))
+        } else {
+            RegDeleteValueW(key, NAME)
+        };
+        let _ = RegCloseKey(key);
+        if result == ERROR_SUCCESS || (!enabled && result == ERROR_FILE_NOT_FOUND) {
+            Ok(())
+        } else {
+            Err("无法更新开机启动项。".into())
+        }
+    }
 }
 
 fn save_config(app: &AppHandle, config: &Config) -> Result<(), String> {
@@ -714,6 +758,9 @@ pub fn run() {
                 names: Mutex::new(Vec::new()),
             });
             if let Err(err) = register_shortcut(app.handle(), &config.shortcut) {
+                eprintln!("{err}");
+            }
+            if let Err(err) = set_launch_at_login(config.launch_at_login) {
                 eprintln!("{err}");
             }
             setup_tray(app.handle())?;

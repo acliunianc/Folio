@@ -2316,6 +2316,7 @@ function Settings({
   const [root, setRoot] = useState(config.root);
   const [dropMode, setDropMode] = useState<DropMode>(config.dropMode);
   const [shortcut, setShortcut] = useState(config.shortcut);
+  const [launchAtLogin, setLaunchAtLogin] = useState(config.launchAtLogin);
   const [capturing, setCapturing] = useState(false);
 
   return (
@@ -2325,7 +2326,7 @@ function Settings({
         onClick={(event) => event.stopPropagation()}
         onSubmit={(event) => {
           event.preventDefault();
-          void onSave({ root, dropMode, shortcut }).catch(onError);
+          void onSave({ root, dropMode, shortcut, launchAtLogin }).catch(onError);
         }}
       >
         <h2 className="mb-5 text-xl">设置</h2>
@@ -2370,6 +2371,18 @@ function Settings({
                 {label}
               </button>
             ))}
+          </div>
+        </div>
+        <div className="mb-4 text-sm text-[#f4f1ea]/70">
+          开机启动
+          <div className="mt-2">
+            <button
+              type="button"
+              className={`rounded-full px-3 py-1 ${launchAtLogin ? "bg-[#e2b657] text-[#241c0d]" : "bg-white/10 text-[#f4f1ea]"}`}
+              onClick={() => setLaunchAtLogin((enabled) => !enabled)}
+            >
+              {launchAtLogin ? "已开启" : "已关闭"}
+            </button>
           </div>
         </div>
         <label className="mb-6 block text-sm text-[#f4f1ea]/70">

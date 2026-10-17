@@ -4,6 +4,7 @@ export type Config = {
   root: string;
   dropMode: DropMode;
   shortcut: string;
+  launchAtLogin: boolean;
 };
 
 export type Placement = {
