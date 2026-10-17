@@ -43,7 +43,7 @@ function DropMark() {
   if (!shown) return null;
   return (
     <div className="grid h-screen w-screen place-items-center">
-      <img src="/tauri.svg" alt="" className="h-9 w-9 object-contain" draggable={false} />
+      <img src="/LOGO.png" alt="" className="h-12 w-12 object-contain" draggable={false} />
     </div>
   );
 }
