@@ -16,11 +16,7 @@ export function arrange(
     const note = place?.note ?? false;
     const spanCol = clamp(place?.spanCol ?? (note ? 2 : 1), 1, 3);
     const spanRow = clamp(place?.spanRow ?? (note ? 2 : 1), 1, 3);
-    const positioned =
-      place != null &&
-      place.col >= 0 &&
-      place.row >= 0 &&
-      place.col + spanCol <= cols;
+    const positioned = place != null && place.col >= 0 && place.row >= 0;
     if (!positioned) {
       pending.push({ entry, spanCol, spanRow, note });
       continue;

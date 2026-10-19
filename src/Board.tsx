@@ -115,24 +115,36 @@ export function Board({
         {cells.map((slot) => (
           <Cell key={`${slot.col}-${slot.row}`} col={slot.col} row={slot.row} footprint={footprint} idPrefix={idPrefix} />
         ))}
-          {items.map((item) => (
+          {items.map((item) => {
+            const dragged = activeName ? items.find((entry) => entry.name === activeName) : undefined;
+            const grouping = Boolean(overName === item.name && dragged && dragged.name !== item.name);
+            const kids = item.kind === "folder" ? [...(folderKids[item.path] ?? [])] : [];
+            if (grouping && dragged) {
+              const incoming = { name: dragged.name, kind: dragged.kind, path: dragged.path };
+              if (!kids.some((child) => child.path === incoming.path)) kids.unshift(incoming);
+              if (item.kind !== "folder") {
+                kids.unshift({ name: item.name, kind: item.kind, path: item.path });
+              }
+            }
+            return (
             <Tile
               key={item.name}
               item={item}
               cell={cell}
               editing={editing}
               icon={icons[item.path]}
-          kids={item.kind === "folder" ? (folderKids[item.path] ?? []) : []}
-          icons={icons}
+              kids={kids.slice(0, 9)}
+              icons={icons}
               dragging={activeName === item.name}
-              grouping={overName === item.name && activeName !== item.name}
+              grouping={grouping}
               onOpen={() => onOpen(item)}
               onRemove={() => onRemove(item)}
               onNote={(content) => onNote(item, content)}
               onResize={(spanCol, spanRow) => onResize(item.name, spanCol, spanRow)}
               idPrefix={idPrefix}
             />
-          ))}
+            );
+          })}
         </div>
     </div>
   );
@@ -223,8 +235,11 @@ function Tile({
       {...listeners}
       {...attributes}
       onClick={(event) => {
-        if (editing) return;
         event.stopPropagation();
+        if (editing) {
+          if (item.kind === "folder") onOpen();
+          return;
+        }
         if (item.note) {
           setWriting(true);
           return;
@@ -286,7 +301,7 @@ function FileCard({
   const iconSize = snapIconSize(cell * 0.62);
   return (
     <div className={`flex h-full flex-col items-center justify-start gap-1.5 rounded-2xl px-1.5 pt-1 ${grouping ? "bg-white/10 ring-2 ring-[#e2b657]" : ""}`}>
-      {item.kind === "folder" ? (
+      {item.kind === "folder" || grouping ? (
         <GroupGlyph kids={kids} icons={icons} size={iconSize} />
       ) : icon ? (
         <img src={icon} alt="" className="object-contain" style={{ width: iconSize, height: iconSize }} draggable={false} />
@@ -327,10 +342,20 @@ export function GroupGlyph({
       {Array.from({ length: 9 }, (_, index) => {
         const child = kids[index];
         if (!child) return <span key={index} />;
-        return icons[child.path] ? (
-          <img key={child.path} src={icons[child.path]} alt="" className="h-full w-full object-contain" draggable={false} />
-        ) : (
-          <span key={child.path} className={`rounded-[22%] ${child.kind === "folder" ? "bg-[#d7b15a]" : "bg-white/75"}`} />
+        if (icons[child.path]) {
+          return <img key={child.path} src={icons[child.path]} alt="" className="h-full w-full object-contain" draggable={false} />;
+        }
+        const ext = child.name.includes(".") ? child.name.split(".").pop()?.toLowerCase() ?? "" : "";
+        const tone = child.kind === "folder" ? tones.folder : (tones[ext] ?? "#8d8a84");
+        const mark = child.kind === "folder" ? "" : (marks[ext] ?? (ext || "档").slice(0, 2).toUpperCase());
+        return (
+          <span
+            key={child.path}
+            className="grid place-items-center rounded-[22%] font-semibold leading-none text-[#1c1a16]"
+            style={{ background: tone, fontSize: Math.max(7, size * 0.16) }}
+          >
+            {mark}
+          </span>
         );
       })}
     </div>

@@ -45,7 +45,7 @@ import {
   writeNote,
 } from "./api";
 import { Board, snapIconSize } from "./Board";
-import { arrange, moveItem, packTopLeft, placePacked, resizeItem } from "./layout";
+import { arrange, moveItem, placePacked, resizeItem } from "./layout";
 import { WorkspaceRail } from "./WorkspaceRail";
 import type { Config, DropMode, FolderChild, GridItem, Placement } from "./types";
 
@@ -67,6 +67,18 @@ type Carry = {
   width: number;
   height: number;
   node: HTMLElement;
+  spanCol: number;
+  spanRow: number;
+  note: boolean;
+};
+
+type Pin = {
+  name: string;
+  col: number;
+  row: number;
+  spanCol: number;
+  spanRow: number;
+  note: boolean;
 };
 
 function cellsOf(col: number, row: number) {
@@ -86,6 +98,7 @@ function itemOutsidePanel(name: string) {
 const snapTopLeft: Modifier = ({ transform, draggingNodeRect, active }) => {
   const data = active?.data.current as DragData | undefined;
   if (!draggingNodeRect || data?.type !== "item") return transform;
+  if (aimWithPointer) return transform;
   const left = draggingNodeRect.left + transform.x;
   const top = draggingNodeRect.top + transform.y;
   const panel = document.querySelector("[data-folder-panel]");
@@ -119,17 +132,19 @@ const snapTopLeft: Modifier = ({ transform, draggingNodeRect, active }) => {
 };
 
 let outsideCollision: ReturnType<CollisionDetection> | null = null;
+const dragPointer = { x: 0, y: 0 };
+let aimWithPointer = false;
 
 const alignByTopLeft: CollisionDetection = ({ collisionRect, droppableContainers, droppableRects }) => {
-  const x = collisionRect.left + 1;
-  const y = collisionRect.top + 1;
+  const x = aimWithPointer ? dragPointer.x : collisionRect.left + 1;
+  const y = aimWithPointer ? dragPointer.y : collisionRect.top + 1;
   const panel = document.querySelector("[data-folder-panel]");
   if (panel) {
     const box = panel.getBoundingClientRect();
     const outside = x < box.left || x > box.right || y < box.top || y > box.bottom;
     // Keep the previous cell while the item is outside the panel. Changing the drop
     // target here swaps scroll parents and makes dnd-kit remeasure without end.
-    if (outside) return outsideCollision ?? [];
+    if (outside) return aimWithPointer ? [] : (outsideCollision ?? []);
   } else {
     outsideCollision = null;
   }
@@ -167,7 +182,7 @@ const alignByTopLeft: CollisionDetection = ({ collisionRect, droppableContainers
     if (overIncoming !== inIncoming) continue;
     const rect = droppableRects.get(container.id);
     if (!rect) continue;
-    const distance = (collisionRect.left - rect.left) ** 2 + (collisionRect.top - rect.top) ** 2;
+    const distance = (x - rect.left) ** 2 + (y - rect.top) ** 2;
     if (distance < bestDistance) {
       bestDistance = distance;
       best = container;
@@ -235,8 +250,11 @@ export default function App() {
   const carryListen = useRef<(() => void) | null>(null);
   const seenInside = useRef(false);
   const editingRef = useRef(false);
-  const editing = batchEdit || activeName !== null || carry !== null;
+  const batchEditRef = useRef(false);
+  const holdEditTimer = useRef<number | null>(null);
+  const editing = batchEdit;
   editingRef.current = editing;
+  batchEditRef.current = batchEdit;
   itemsRef.current = items;
   colsRef.current = cols;
   rowsRef.current = rows;
@@ -269,6 +287,47 @@ export default function App() {
   overviewRef.current = overview;
 
   useEffect(() => {
+    const down = (event: PointerEvent) => {
+      if (event.button !== 0 || batchEditRef.current || overviewRef.current) return;
+      const target = event.target;
+      if (!(target instanceof Element) || target.closest("button") || !target.closest("[data-item]")) return;
+      const startX = event.clientX;
+      const startY = event.clientY;
+      let entered = false;
+      const timer = window.setTimeout(() => {
+        entered = true;
+        holdEditTimer.current = null;
+        setBatchEdit(true);
+        const swallow = (click: Event) => {
+          click.preventDefault();
+          click.stopPropagation();
+          window.removeEventListener("click", swallow, true);
+        };
+        window.addEventListener("click", swallow, true);
+        window.setTimeout(() => window.removeEventListener("click", swallow, true), 400);
+      }, 450);
+      holdEditTimer.current = timer;
+      const move = (ev: PointerEvent) => {
+        if (Math.hypot(ev.clientX - startX, ev.clientY - startY) <= 8) return;
+        window.clearTimeout(timer);
+        if (holdEditTimer.current === timer) holdEditTimer.current = null;
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", up);
+      };
+      const up = () => {
+        if (!entered) window.clearTimeout(timer);
+        if (holdEditTimer.current === timer) holdEditTimer.current = null;
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", up);
+      };
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up);
+    };
+    window.addEventListener("pointerdown", down, true);
+    return () => window.removeEventListener("pointerdown", down, true);
+  }, []);
+
+  useEffect(() => {
     let cancelled = false;
     void Promise.all(workspaces.map(async (name) => [name, await readWorkspaceBackground(name)] as const)).then((pairs) => {
       if (cancelled) return;
@@ -285,7 +344,7 @@ export default function App() {
 
   const sensors = useSensors(
     useSensor(PointerSensor, {
-      activationConstraint: batchEdit ? { distance: 4 } : { delay: 280, tolerance: 6 },
+      activationConstraint: { distance: 4 },
     }),
   );
 
@@ -319,7 +378,7 @@ export default function App() {
   }, []);
 
   const loadBoard = useCallback(
-    async (name: string, path: string[], minRows: number) => {
+    async (name: string, path: string[], minRows: number, pin?: Pin) => {
       if (!name) {
         setItems([]);
         setBoardKey("");
@@ -334,23 +393,32 @@ export default function App() {
         setFolders(released);
         return;
       }
-      if (await dissolveSingletonGroups(name, path)) {
+      if (await dissolveSingletonGroups(name, path, carryRef.current?.source)) {
         if (ticket !== boardRequest.current) return;
         boardCache.current.delete(storageKey(name, path));
       }
       const listing = await listDir(name, path);
       if (ticket !== boardRequest.current) return;
-      const arranged = arrange(listing.entries, listing.layout, cols, minRows);
+      const layout = { ...listing.layout };
+      if (pin) {
+        layout[pin.name] = {
+          col: pin.col,
+          row: pin.row,
+          spanCol: pin.spanCol,
+          spanRow: pin.spanRow,
+          note: pin.note,
+        };
+      }
+      const arranged = arrange(listing.entries, layout, cols, minRows);
       if (ticket !== boardRequest.current) return;
       let nextItems = arranged.items;
-      let dirty = arranged.dirty;
+      let dirty = arranged.dirty || Boolean(pin);
       let nextRows = arranged.rows;
-      if (path.length > 0) {
-        const packed = packTopLeft(nextItems, folderColsRef.current);
-        if (!samePlaces(nextItems, packed)) {
-          nextItems = packed;
-          dirty = true;
-          nextRows = Math.max(nextRows, ...packed.map((item) => item.row + item.spanRow));
+      if (pin) {
+        const moved = moveItem(nextItems, pin.name, pin.col, pin.row, cols, Math.max(nextRows, pin.row + pin.spanRow));
+        if (moved !== nextItems) {
+          nextItems = moved;
+          nextRows = Math.max(nextRows, ...moved.map((item) => item.row + item.spanRow));
         }
       }
       if (ticket !== boardRequest.current) return;
@@ -664,6 +732,7 @@ export default function App() {
     setIncomingItems(null);
     edgeListen.current?.();
     edgeListen.current = null;
+    aimWithPointer = false;
     if (groupTimer.current != null) window.clearTimeout(groupTimer.current);
     groupTimer.current = null;
     groupPending.current = null;
@@ -676,6 +745,43 @@ export default function App() {
       dragged.current = false;
     }, 80);
     if (exported || !active || active.type !== "item" || !workspace) return;
+    if (batchEditRef.current) {
+      const dragging = items.find((item) => item.name === active.name);
+      const host =
+        tileCenterHost(items, active.name) ??
+        dropHost(items, dragging, over) ??
+        (() => {
+          const pointed = itemUnderPointer(lastPointer.current.x, lastPointer.current.y, active.name);
+          return pointed ? items.find((item) => item.name === pointed) : undefined;
+        })();
+      try {
+        if (dragging && !dragging.note && host && !host.note && host.name !== dragging.name) {
+          if (host.kind === "folder") {
+            await moveInto(workspace, folders, active.name, host.name);
+          } else {
+            const groupName = await groupItems(workspace, folders, [host.name, active.name]);
+          await loadBoard(workspace, folders, measureRows(), {
+            name: groupName,
+            col: host.col,
+            row: host.row,
+            spanCol: host.spanCol,
+            spanRow: host.spanRow,
+            note: false,
+          });
+          }
+          if (host.kind === "folder") await loadBoard(workspace, folders, measureRows());
+        } else if (dragging && over?.type === "cell") {
+          const next =
+            folders.length > 0
+              ? placePacked(items, active.name, over.col, over.row, folderColsRef.current)
+              : moveItem(items, active.name, over.col, over.row, cols, rows);
+          if (next !== items) await persist(next);
+        }
+      } catch (error) {
+        showError(error);
+      }
+      return;
+    }
     if (targetWorkspace && targetWorkspace !== workspace) {
       const spot = over?.type === "cell" ? over : null;
       boardCache.current.delete(storageKey(workspace, folders));
@@ -693,21 +799,23 @@ export default function App() {
       setBoardKey(storageKey(targetWorkspace, []));
       return;
     }
-    if (folders.length > 0 && itemOutsidePanel(active.name)) {
+    if (folders.length > 0 && itemOutsidePanel(active.name) && !document.querySelector("[data-folder-panel]")) {
       const parentPath = folders.slice(0, -1);
       suppressDrop.current = true;
       boardCache.current.delete(storageKey(workspace, parentPath));
       try {
+        const dragging = items.find((item) => item.name === active.name);
+        const spot = cellAt(lastPointer.current.x, lastPointer.current.y);
         await moveEntry(workspace, folders, active.name, workspace, parentPath);
         setFolders(parentPath);
-        const listed = await loadBoard(workspace, parentPath, measureRows());
-        const spot = cellAt(lastPointer.current.x, lastPointer.current.y);
-        if (listed && spot) {
-          const next = parentPath.length > 0
-            ? placePacked(listed, active.name, spot.col, spot.row, folderColsRef.current)
-            : moveItem(listed, active.name, spot.col, spot.row, cols, rows);
-          if (next !== listed) await persist(next);
-        }
+        await loadBoard(
+          workspace,
+          parentPath,
+          measureRows(),
+          dragging && spot
+            ? { name: active.name, col: spot.col, row: spot.row, spanCol: dragging.spanCol, spanRow: dragging.spanRow, note: dragging.note }
+            : undefined,
+        );
       } catch (error) {
         showError(error);
       } finally {
@@ -777,6 +885,7 @@ export default function App() {
     setIncomingItems(null);
     edgeListen.current?.();
     edgeListen.current = null;
+    aimWithPointer = false;
     handedOff.current = false;
     groupPending.current = null;
     if (groupTimer.current != null) window.clearTimeout(groupTimer.current);
@@ -790,6 +899,10 @@ export default function App() {
   }
 
   function onDragStart(event: DragStartEvent) {
+    if (holdEditTimer.current != null) {
+      window.clearTimeout(holdEditTimer.current);
+      holdEditTimer.current = null;
+    }
     const data = event.active.data.current as DragData | undefined;
     if (data?.type === "item") {
       dragged.current = true;
@@ -800,10 +913,31 @@ export default function App() {
       groupPending.current = null;
       if (event.activatorEvent instanceof MouseEvent) {
         lastPointer.current = { x: event.activatorEvent.clientX, y: event.activatorEvent.clientY };
+        dragPointer.x = event.activatorEvent.clientX;
+        dragPointer.y = event.activatorEvent.clientY;
       }
+      aimWithPointer = false;
       edgeListen.current?.();
       const track = (ev: PointerEvent) => {
         lastPointer.current = { x: ev.clientX, y: ev.clientY };
+        dragPointer.x = ev.clientX;
+        dragPointer.y = ev.clientY;
+        const panel = document.querySelector("[data-folder-panel]");
+        if (panel instanceof HTMLElement) {
+          const box = panel.getBoundingClientRect();
+          const outside = ev.clientX < box.left || ev.clientX > box.right || ev.clientY < box.top || ev.clientY > box.bottom;
+          if (outside) {
+            aimWithPointer = true;
+            setOverCell((current) => (current ? null : current));
+          }
+        }
+        if (batchEditRef.current) {
+          const host = tileCenterHost(itemsRef.current, data.name);
+          const groupName = host && !host.note ? host.name : null;
+          setOverName(groupName);
+          armOpen(groupName);
+          return;
+        }
         const under = document.elementFromPoint(ev.clientX, ev.clientY);
         const workspaceHit = under instanceof Element ? under.closest("[data-workspace-name]") : null;
         const nextTarget = workspaceHit?.getAttribute("data-workspace-name") ?? null;
@@ -840,12 +974,13 @@ export default function App() {
         activeNameRef.current = null;
         void dragFileOut(dragging.path).catch(showError);
       };
-      window.addEventListener("pointermove", track);
-      edgeListen.current = () => window.removeEventListener("pointermove", track);
+      window.addEventListener("pointermove", track, true);
+      edgeListen.current = () => window.removeEventListener("pointermove", track, true);
     }
   }
 
   function armOpen(name: string | null) {
+    if (!batchEditRef.current) name = null;
     const dragging = itemsRef.current.find((item) => item.name === activeNameRef.current);
     if (dragging?.note) name = null;
     if (name) {
@@ -860,7 +995,7 @@ export default function App() {
     groupTimer.current = window.setTimeout(() => {
       if (groupPending.current !== name) return;
       void diveInto(name);
-    }, 600);
+    }, 700);
   }
 
   function watchLeave() {
@@ -899,6 +1034,7 @@ export default function App() {
     const height = shot?.height ?? ghostRect?.height ?? 96;
     const left = ghostRect?.left ?? lastPointer.current.x - width / 2;
     const top = ghostRect?.top ?? lastPointer.current.y - height / 2;
+    const carried = itemsRef.current.find((item) => item.name === name);
     if (!name || !shot) return null;
     return {
       name,
@@ -910,6 +1046,9 @@ export default function App() {
       width,
       height,
       node: shot.node,
+      spanCol: carried?.spanCol ?? 1,
+      spanRow: carried?.spanRow ?? 1,
+      note: carried?.note ?? false,
     } satisfies Carry;
   }
 
@@ -927,7 +1066,7 @@ export default function App() {
     );
     const dragging = itemsRef.current.find((item) => item.name === name);
     if (dragging?.note || host?.note) return null;
-    return host && !isApp(host) ? host.name : null;
+    return host && !host.note ? host.name : null;
   }
 
   function startCarry(session: Carry) {
@@ -942,7 +1081,11 @@ export default function App() {
       const top = event.clientY - session.offsetY;
       setCarry((current) => (current ? { ...current, x: left, y: top } : current));
       watchLeave();
-      const host = hostAt(left + 8, top + 8);
+      if (!document.querySelector("[data-folder-panel]")) {
+        const spot = cellAt(event.clientX, event.clientY);
+        setOverCell((current) => (current?.col === spot?.col && current?.row === spot?.row ? current : spot));
+      }
+      const host = hostAt(event.clientX, event.clientY);
       armOpen(host);
     };
     const up = (event: PointerEvent) => {
@@ -964,7 +1107,7 @@ export default function App() {
     const name = activeNameRef.current;
     const host = itemsRef.current.find((item) => item.name === targetName);
     const dragging = itemsRef.current.find((item) => item.name === name);
-    if (!name || !host || host.name === name || isApp(host) || host.note || dragging?.note) return;
+    if (!name || !host || host.name === name || host.note || dragging?.note) return;
     opening.current = true;
     suppressDrop.current = true;
     seenInside.current = false;
@@ -987,6 +1130,12 @@ export default function App() {
       } else {
         const groupName = await groupItems(workspace, source, [host.name, name]);
         nextPath = [...source, groupName];
+        const listing = await listDir(workspace, source);
+        const layout = { ...listing.layout };
+        delete layout[name];
+        delete layout[host.name];
+        layout[groupName] = { col: host.col, row: host.row, spanCol: host.spanCol, spanRow: host.spanRow, note: false };
+        await saveLayout(workspace, source, layout);
       }
       if (session) {
         session.source = nextPath;
@@ -1033,13 +1182,11 @@ export default function App() {
     };
     window.addEventListener("pointerup", onUp, true);
     try {
-      const session = rememberCarry(parent);
+      const session = rememberCarry(source);
       if (session) {
         carryRef.current = session;
         setCarry(session);
       }
-      await moveEntry(workspace, source, name, workspace, parent);
-      boardCache.current.delete(storageKey(workspace, source));
       boardCache.current.delete(storageKey(workspace, parent));
       setFolders(parent);
       await loadBoard(workspace, parent, measureRows());
@@ -1071,8 +1218,6 @@ export default function App() {
     window.setTimeout(() => {
       dragged.current = false;
     }, 80);
-    const left = clientX - session.offsetX;
-    const top = clientY - session.offsetY;
     const destination = [...surface.current.folders];
     try {
       if (session.source.join("/") !== destination.join("/")) {
@@ -1080,13 +1225,15 @@ export default function App() {
         boardCache.current.delete(storageKey(workspace, session.source));
         boardCache.current.delete(storageKey(workspace, destination));
       }
-      const listed = (await loadBoard(workspace, destination, measureRows())) ?? itemsRef.current;
-      const spot = cellAt(left + 8, top + 8) ?? cellAt(clientX, clientY);
-      if (!listed.some((item) => item.name === session.name) || !spot) return;
-      const next = destination.length > 0
-        ? placePacked(listed, session.name, spot.col, spot.row, folderColsRef.current)
-        : moveItem(listed, session.name, spot.col, spot.row, colsRef.current, rowsRef.current);
-      if (next !== listed) await persist(next);
+      const spot = cellAt(clientX, clientY);
+      await loadBoard(
+        workspace,
+        destination,
+        measureRows(),
+        spot
+          ? { name: session.name, col: spot.col, row: spot.row, spanCol: session.spanCol, spanRow: session.spanRow, note: session.note }
+          : undefined,
+      );
     } catch (error) {
       showError(error);
     } finally {
@@ -1140,8 +1287,28 @@ export default function App() {
       return;
     }
     const dragging = active?.type === "item" ? items.find((item) => item.name === active.name) : undefined;
+    if (batchEditRef.current) {
+      const host = dragging ? tileCenterHost(items, dragging.name) : undefined;
+      const groupName = host && !host.note ? host.name : null;
+      setOverName(groupName);
+      armOpen(groupName);
+      if (
+        !groupName &&
+        over?.type === "cell" &&
+        dragging &&
+        over.col + dragging.spanCol <= cols &&
+        over.row + dragging.spanRow <= rows
+      ) {
+        setOverCell({ col: over.col, row: over.row });
+      } else {
+        setOverCell(null);
+      }
+      return;
+    }
+    setOverName(null);
     if (over?.type === "cell" && dragging && over.col + dragging.spanCol <= cols && over.row + dragging.spanRow <= rows) {
-      setOverCell({ col: over.col, row: over.row });
+      if (batchEditRef.current) setOverCell(null);
+      else setOverCell({ col: over.col, row: over.row });
       const host = items.find(
         (item) =>
           item.name !== dragging.name &&
@@ -1378,6 +1545,7 @@ export default function App() {
           ref={frame}
           className="absolute inset-0 overflow-hidden"
           onPointerDown={(event) => {
+            if (event.button !== 0) return;
             const target = event.target as HTMLElement;
             if (
               overview ||
@@ -1551,7 +1719,7 @@ export default function App() {
             />
           )}
           {editing && workspace && (
-          <div className="absolute bottom-24 left-1/2 z-20 flex -translate-x-1/2 items-center gap-2 rounded-full bg-black/50 px-3 py-2 backdrop-blur">
+          <div className="absolute bottom-24 left-1/2 z-40 flex -translate-x-1/2 items-center gap-2 rounded-full bg-black/50 px-3 py-2 backdrop-blur">
             <DockButton onClick={() => void addPicked(false).catch(showError)}>放入文件</DockButton>
             <DockButton onClick={() => void addPicked(true).catch(showError)}>放入文件夹</DockButton>
             <DockButton
@@ -1847,8 +2015,8 @@ export default function App() {
           </div>
         )}
       </main>
-      <DragOverlay className="pointer-events-none" style={ghost ? { width: ghost.width, height: ghost.height } : undefined}>
-        {ghost ? <DragGhost node={ghost.node} /> : null}
+      <DragOverlay dropAnimation={null} className="pointer-events-none" style={ghost ? { width: ghost.width, height: ghost.height } : undefined}>
+        {ghost ? <DragGhost node={ghost.node} hidden={batchEdit && Boolean(overName)} /> : null}
       </DragOverlay>
       {carry && (
         <div
@@ -1904,12 +2072,12 @@ function snapshotItem(name: string) {
   return { node: clone, width: source.offsetWidth, height: source.offsetHeight };
 }
 
-function DragGhost({ node }: { node: HTMLElement }) {
+function DragGhost({ node, hidden = false }: { node: HTMLElement; hidden?: boolean }) {
   const host = useRef<HTMLDivElement>(null);
   useEffect(() => {
     host.current?.replaceChildren(node);
   }, [node]);
-  return <div ref={host} data-drag-ghost className="pointer-events-none h-full w-full" />;
+  return <div ref={host} data-drag-ghost className={`pointer-events-none h-full w-full ${hidden ? "opacity-0" : ""}`} />;
 }
 
 const FREQUENT_KEY = "workspace-frequent";
@@ -2207,15 +2375,6 @@ function cellAt(x: number, y: number) {
   return null;
 }
 
-function samePlaces(current: GridItem[], next: GridItem[]) {
-  if (current.length !== next.length) return false;
-  const byName = new Map(current.map((item) => [item.name, item]));
-  return next.every((item) => {
-    const previous = byName.get(item.name);
-    return previous?.col === item.col && previous.row === item.row;
-  });
-}
-
 function storageKey(name: string, path: string[]) {
   return `${name}/${path.join("/")}`;
 }
@@ -2229,28 +2388,114 @@ async function releaseSingletonGroup(workspace: string, path: string[]): Promise
   const listing = await listDir(workspace, path);
   if (listing.entries.length > 1) return null;
   const parent = path.slice(0, -1);
-  if (listing.entries.length === 1) {
-    await moveEntry(workspace, path, listing.entries[0].name, workspace, parent);
-  }
-  await deleteEntry(workspace, parent, path[path.length - 1]);
+  const groupName = path[path.length - 1];
+  const only = listing.entries[0];
+  if (only) await moveEntry(workspace, path, only.name, workspace, parent);
+  await deleteEntry(workspace, parent, groupName);
+  await keepGroupPlace(workspace, parent, groupName, only ? { name: only.name, note: only.content != null || Boolean(listing.layout[only.name]?.note) } : null);
   return parent;
 }
 
-async function dissolveSingletonGroups(workspace: string, path: string[]): Promise<boolean> {
+async function dissolveSingletonGroups(workspace: string, path: string[], skip?: string[]): Promise<boolean> {
   const listing = await listDir(workspace, path);
   let changed = false;
   for (const entry of listing.entries) {
     if (entry.kind !== "folder" || !isMadeGroup(entry.name)) continue;
+    if (skip && skip.length === path.length + 1 && skip[path.length] === entry.name && skip.slice(0, -1).every((part, index) => part === path[index])) continue;
     const childPath = [...path, entry.name];
     const inner = await listDir(workspace, childPath);
     if (inner.entries.length > 1) continue;
-    if (inner.entries.length === 1) {
-      await moveEntry(workspace, childPath, inner.entries[0].name, workspace, path);
-    }
+    const only = inner.entries[0];
+    if (only) await moveEntry(workspace, childPath, only.name, workspace, path);
     await deleteEntry(workspace, path, entry.name);
+    await keepGroupPlace(workspace, path, entry.name, only ? { name: only.name, note: only.content != null || Boolean(inner.layout[only.name]?.note) } : null);
     changed = true;
   }
   return changed;
+}
+
+async function keepGroupPlace(
+  workspace: string,
+  parent: string[],
+  groupName: string,
+  child: { name: string; note: boolean } | null,
+) {
+  const listing = await listDir(workspace, parent);
+  const place = listing.layout[groupName];
+  const layout = { ...listing.layout };
+  delete layout[groupName];
+  if (child && place && place.col >= 0 && place.row >= 0) {
+    layout[child.name] = {
+      col: place.col,
+      row: place.row,
+      spanCol: place.spanCol,
+      spanRow: place.spanRow,
+      note: child.note,
+    };
+  }
+  await saveLayout(workspace, parent, layout);
+}
+
+function tileCenterHost(items: GridItem[], name: string) {
+  const node =
+    document.querySelector("[data-drag-ghost]") ??
+    document.querySelector(`[data-folder-panel] [data-item][data-name="${CSS.escape(name)}"]`) ??
+    document.querySelector(`[data-zoom-target] [data-item][data-name="${CSS.escape(name)}"]`);
+  if (!(node instanceof HTMLElement)) return undefined;
+  const rect = node.getBoundingClientRect();
+  if (rect.width < 8 || rect.height < 8) return undefined;
+  const spot = cellUnderPoint(rect.left + rect.width / 2, rect.top + Math.min(40, rect.height / 2));
+  if (!spot) return undefined;
+  return items.find(
+    (item) =>
+      item.name !== name &&
+      spot.col >= item.col &&
+      spot.row >= item.row &&
+      spot.col < item.col + item.spanCol &&
+      spot.row < item.row + item.spanRow,
+  );
+}
+
+function cellUnderPoint(x: number, y: number) {
+  const panel = document.querySelector("[data-folder-panel]");
+  const scope = panel ?? document.querySelector("[data-zoom-target]");
+  if (!scope) return null;
+  for (const cell of scope.querySelectorAll<HTMLElement>("[data-cell]")) {
+    if (cell.dataset.col == null || cell.dataset.row == null) continue;
+    const rect = cell.getBoundingClientRect();
+    if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) {
+      return { col: Number(cell.dataset.col), row: Number(cell.dataset.row) };
+    }
+  }
+  return null;
+}
+
+function itemUnderPointer(x: number, y: number, self: string | null) {
+  for (const node of document.elementsFromPoint(x, y)) {
+    if (!(node instanceof Element) || node.closest("[data-drag-ghost]")) continue;
+    const host = node.closest("[data-item]");
+    if (!(host instanceof HTMLElement)) continue;
+    const name = host.dataset.name ?? null;
+    if (!name || name === self) continue;
+    return name;
+  }
+  return null;
+}
+
+function dropHost(items: GridItem[], dragging: GridItem | undefined, over: DragData | undefined) {
+  if (!dragging || !over) return undefined;
+  if (over.type === "item" && over.name !== dragging.name) {
+    return items.find((item) => item.name === over.name);
+  }
+  if (over.type !== "cell") return undefined;
+  return items.find(
+    (item) =>
+      item.name !== dragging.name &&
+      over.col >= item.col &&
+      over.row >= item.row &&
+      over.col < item.col + item.spanCol &&
+      over.row < item.row + item.spanRow,
+  );
 }
 
 function isApp(item: GridItem) {
