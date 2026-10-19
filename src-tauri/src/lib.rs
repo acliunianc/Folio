@@ -204,14 +204,20 @@ fn open_path(app: AppHandle, path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn open_with(app_path: String, file_path: String) -> Result<(), String> {
-    let app = std::path::PathBuf::from(&app_path);
-    let target = if app.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("lnk")) {
-        resolve_shortcut(&app)?
+fn open_with(app: AppHandle, app_path: String, file_path: String) -> Result<(), String> {
+    let program_path = std::path::PathBuf::from(&app_path);
+    let program = if program_path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("lnk"))
+    {
+        resolve_shortcut(&program_path)?
     } else {
-        app
+        program_path
     };
-    launch_app(&target, &file_path)
+    let target = export_path(&file_path)?;
+    launch_app(&program, &target)?;
+    hide_window(&app);
+    Ok(())
 }
 
 #[tauri::command]
@@ -251,10 +257,7 @@ fn clipboard_files() -> Vec<String> {
 
 #[tauri::command]
 fn drag_file_out(app: AppHandle, path: String) -> Result<bool, String> {
-    let file = std::path::PathBuf::from(&path);
-    if !file.exists() {
-        return Err("找不到这个文件。".into());
-    }
+    let path = export_path(&path)?;
     let (tx, rx) = std::sync::mpsc::channel();
     let handle = app.clone();
     app.run_on_main_thread(move || {
@@ -262,6 +265,27 @@ fn drag_file_out(app: AppHandle, path: String) -> Result<bool, String> {
     })
     .map_err(|err| err.to_string())?;
     rx.recv().unwrap_or(Err("拖拽被中断。".into()))
+}
+
+fn export_path(path: &str) -> Result<String, String> {
+    let file = std::path::PathBuf::from(path);
+    if !file.exists() {
+        return Err("找不到这个文件。".into());
+    }
+    let shortcut = file
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("lnk"));
+    if !shortcut {
+        return Ok(path.to_string());
+    }
+    let target = resolve_shortcut(&file)?;
+    if !target.is_dir() {
+        return Ok(path.to_string());
+    }
+    if !target.exists() {
+        return Err("快捷方式指向的文件夹不存在。".into());
+    }
+    Ok(target.to_string_lossy().into_owned())
 }
 
 #[tauri::command]

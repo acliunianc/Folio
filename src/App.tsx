@@ -727,7 +727,7 @@ export default function App() {
             over.col < item.col + item.spanCol &&
             over.row < item.row + item.spanRow,
         );
-        if (host && dragging && isApp(host) && dragging.kind === "file" && !dragging.note) {
+        if (host && dragging && isApp(host) && opensInApp(dragging)) {
           await openWith(host.path, dragging.path);
         } else if (host?.kind === "folder" && !dragging?.note) {
           await moveInto(workspace, folders, active.name, host.name);
@@ -746,7 +746,7 @@ export default function App() {
         }
       } else if (over.type === "item" && over.name !== active.name) {
         const target = items.find((item) => item.name === over.name);
-        if (target && dragging && isApp(target) && dragging.kind === "file" && !dragging.note) {
+        if (target && dragging && isApp(target) && opensInApp(dragging)) {
           await openWith(target.path, dragging.path);
         } else if (target?.kind === "folder" && !dragging?.note) {
           await moveInto(workspace, folders, active.name, over.name);
@@ -2256,6 +2256,10 @@ async function dissolveSingletonGroups(workspace: string, path: string[]): Promi
 function isApp(item: GridItem) {
   const ext = item.name.includes(".") ? (item.name.split(".").pop()?.toLowerCase() ?? "") : "";
   return item.kind === "file" && (ext === "exe" || ext === "lnk");
+}
+
+function opensInApp(item: GridItem) {
+  return !item.note && (item.kind === "file" || item.kind === "folder");
 }
 
 function clamp(value: number, min: number, max: number) {
